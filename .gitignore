@@ -21,3 +21,5 @@ dist/
 # Runtime output
 logs/
 reports/
+PRD.md
+AGENTS.md

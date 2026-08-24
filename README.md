@@ -32,7 +32,7 @@ Ditenagai oleh [OpenRouter](https://openrouter.ai) — model bisa diganti kapan 
 ### Windows (PowerShell)
 
 ```powershell
-git clone https://github.com/USERNAME/cyberaent.git
+git clone https://github.com/Anhar40/cybersec.git
 cd cyberaent
 
 python -m venv .venv
@@ -63,7 +63,7 @@ lalu cukup jalankan `.venv\Scripts\cyberaent.exe`.
 
 ```bash
 sudo apt update && sudo apt install -y python3 python3-venv python3-pip git
-git clone https://github.com/USERNAME/cyberaent.git
+git clone https://github.com/Anhar40/cybersec.git
 cd cyberaent
 
 python3 -m venv .venv
@@ -97,7 +97,7 @@ Distribusi non-Debian tinggal sesuaikan installer venv-nya (mis. `sudo dnf insta
 pkg update && pkg upgrade -y
 pkg install -y python git
 
-git clone https://github.com/USERNAME/cyberaent.git
+git clone https://github.com/Anhar40/cybersec.git
 cd cyberaent
 
 python -m venv .venv
