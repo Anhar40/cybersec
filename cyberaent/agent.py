@@ -9,6 +9,7 @@ from .openrouter import AssistantReply, OpenRouterError
 from .recovery import enrich_failure_payload, is_failed_payload
 from .safety import SafetyGate
 from .tools.base import ToolRegistry
+from .tools.intel import INTEL_TOOL_NAMES
 
 SYSTEM_PROMPT = """\
 You are CyberSec Agent, a senior web-security engineer with about ten years of \
@@ -44,6 +45,30 @@ authorized, start with the quietest tool that answers the question, and fall bac
 with `header_audit`, `web_tech` and `tls_info` before any active scanning. Present a \
 short numbered plan first and adapt it as evidence arrives; report each stage's \
 findings before moving on.
+- You have PERSISTENT STATE. Before acting, read the `<session_state>` block that is \
+injected above the conversation: it lists the plan, known endpoints, known technologies, \
+open hypotheses, user preferences, and the tools already run. Treat it as ground truth \
+instead of relying on your own recollection, and never repeat a tool call the state \
+already records.
+- Manage the assessment with the intel tools: `set_plan` before active testing and \
+`update_plan_step` afterwards (mark a step `blocked` with a note instead of skipping it \
+silently); `remember_endpoint` for every endpoint you learn; `note_observation` for \
+facts worth keeping; `recall_memory` instead of re-crawling; `next_actions` whenever \
+you are unsure what to do next — it returns steps with the tool, the arguments, and \
+the evidence that justifies them.
+- Think in HYPOTHESES, not assertions. When something looks exploitable, record it \
+with `propose_hypothesis` (statement + rationale + test plan), run that test, then close \
+it with `update_hypothesis`: `testing` while probing, `supported` or `refuted` only \
+with finding ids as evidence. A verdict without evidence is rejected — that is \
+deliberate, so use it instead of hand-waving.
+- Findings have a status and must be earned: tool output lands as `observed`; your own \
+`record_finding` starts as `suspected` unless you pass a `verification` note; only \
+`verify_finding` (with the concrete request or output that proves it) promotes it to \
+`verified`, and `confirmed: false` refutes it. Never describe an observation as a \
+confirmed vulnerability.
+- When you report a finding, use this fixed structure: severity · status · target · \
+evidence excerpt · remediation · next step. State what is still unverified instead of \
+smoothing it over.
 - Vulnerability assessment is CONTROLLED by default: prefer `vuln_scan` (nuclei) with \
 a `severity` filter and report its structured findings sorted by severity. Only run \
 `sqli_probe` when the user explicitly asked for SQL-injection testing of that exact \
@@ -134,6 +159,15 @@ class AgentFailure:
     error: OpenRouterError
 
 
+@dataclass(frozen=True)
+class IntelUpdated:
+    """The intel ledgers changed because of a tool call (plan, memory, surface)."""
+
+    tool: str
+    summary: str
+    detail: str = ""
+
+
 Event = (
     AssistantText
     | AssistantDelta
@@ -143,6 +177,7 @@ Event = (
     | ConfirmationRequest
     | TurnLimitReached
     | AgentFailure
+    | IntelUpdated
 )
 
 
@@ -153,6 +188,21 @@ class ChatClient(Protocol):
 
 
 ConfirmCallback = Callable[[ConfirmationRequest], bool]
+
+
+class IntelLayer(Protocol):
+    """What the agent needs from the intel hub (see :mod:`cyberaent.intel`)."""
+
+    def brief(self) -> str: ...
+
+    def state_summary(self) -> str: ...
+
+    def observe_tool_result(
+        self,
+        tool_name: str,
+        payload: Mapping[str, Any],
+        arguments: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any]: ...
 
 
 def _raw_tool_call(call_id: str, name: str, arguments_json: str) -> dict[str, Any]:
@@ -172,12 +222,14 @@ class SecurityAgent:
         *,
         max_tool_rounds: int = 5,
         confirm: ConfirmCallback | None = None,
+        intel: IntelLayer | None = None,
     ):
         self._client = client
         self._registry = registry
         self._gate = gate
         self._max_tool_rounds = max_tool_rounds
         self._confirm = confirm or (lambda _req: False)
+        self._intel = intel
         self._failures: dict[str, int] = {}
         self._failures_seen = 0
         self._recoveries = 0
@@ -192,6 +244,38 @@ class SecurityAgent:
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    def _state_block(self) -> str:
+        if self._intel is None:
+            return ""
+        try:
+            brief = self._intel.brief()
+        except Exception:  # pragma: no cover - intel must never break a turn
+            return ""
+        return brief.strip()
+
+    def _intel_detail(self) -> str:
+        """One-line snapshot of the ledgers, shown next to intel tool results."""
+        if self._intel is None:
+            return ""
+        try:
+            state = self._intel.state_summary()
+        except Exception:  # pragma: no cover - intel must never break a turn
+            return ""
+        return state
+
+    def _remember_tool_result(
+        self, name: str, payload: Mapping[str, Any], arguments: Mapping[str, Any] | None
+    ) -> None:
+        """Feed every successful tool result into the intel ledgers."""
+        if self._intel is None or name in INTEL_TOOL_NAMES:
+            return
+        if not isinstance(payload, Mapping) or not payload:
+            return
+        try:
+            self._intel.observe_tool_result(name, payload, arguments)
+        except Exception:  # pragma: no cover - intel must never break a turn
+            return
 
     def repair_after_interrupt(self) -> None:
         """Close dangling tool calls so history stays valid for the next API call."""
@@ -218,6 +302,20 @@ class SecurityAgent:
         self._failures_seen = 0
         self._recoveries = 0
         self.messages.append({"role": "user", "content": user_text})
+        state = self._state_block()
+        if state:
+            self.messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "<session_state>\n"
+                        f"{state}\n"
+                        "</session_state>\n"
+                        "Trust this state over your own recollection of earlier turns; it "
+                        "was captured automatically from tool results."
+                    ),
+                }
+            )
         rounds = 0
 
         while True:
@@ -378,6 +476,10 @@ class SecurityAgent:
             yield ToolCallEnd(tc.name, ok=False, summary=None)
             return self._with_recovery(tc.name, failure, attempt=prior_failures + 1)
 
+        self._remember_tool_result(
+            tc.name, payload, arguments if isinstance(arguments, Mapping) else None
+        )
+
         failed = is_failed_payload(payload)
         if failed:
             self._note_failure(action_key)
@@ -387,6 +489,8 @@ class SecurityAgent:
         raw_summary = payload.get("summary")
         summary = raw_summary if isinstance(raw_summary, str) else None
         yield ToolCallEnd(tc.name, ok=not failed, summary=summary)
+        if tc.name in INTEL_TOOL_NAMES and not failed:
+            yield IntelUpdated(tc.name, summary or "intel updated", self._intel_detail())
         if not failed:
             return payload
         enriched = self._with_recovery(tc.name, payload, attempt=prior_failures + 1)

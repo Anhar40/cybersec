@@ -7,6 +7,7 @@ Ditenagai oleh [OpenRouter](https://openrouter.ai) — model bisa diganti kapan 
 ## Fitur
 
 - **Agent loop dengan streaming** — balasan model tampil kata demi kata secara live
+- **Intelijen persisten** — rencana kerja, attack-surface graph, memory antar-sesi, ledger hipotesis, dan next-action berbasis bukti (lihat [Lapisan Intelijen](#lapisan-intelijen-persistent-state))
 - **Terminal aman** — tanpa shell mentah; semua command divalidasi sebagai array argv (`shell=False`), lolos safety gate, dibatasi rate limit dan budget sesi
 - **Penghapusan file terkurasi** — `file_delete` dengan guard lokasi sistem, status per-target, dan konfirmasi wajib
 - **Risk tier + konfirmasi** — aksi LOW-risk jalan otomatis; MEDIUM/HIGH selalu minta persetujuan `y/N`
@@ -14,7 +15,7 @@ Ditenagai oleh [OpenRouter](https://openrouter.ai) — model bisa diganti kapan 
 - **Tool Manager** — inventaris tool, instalasi via package manager terdeteksi, verifikasi pasca-install
 - **Web Security & Recon** — curl, nmap, httpx, whatweb, nikto, nuclei, ffuf, dig, openssl, subfinder
 - **Vulnerability Assessment** — `vuln_scan` (nuclei, temuan terstruktur) dan `sqli_probe` (sqlmap profil aman: batch, risk=1)
-- **Evidence & Reporting** — ledger temuan per-sesi dengan auto-capture, laporan Markdown siap pakai
+- **Evidence & Reporting** — ledger temuan dengan status observed → verified, laporan Markdown siap pakai
 
 ## Persyaratan
 
@@ -152,6 +153,11 @@ Slash command yang tersedia:
 | `/help` | Bantuan |
 | `/history` | Riwayat command yang dieksekusi |
 | `/findings` | Lihat evidence ledger temuan saat ini |
+| `/plan` | Lihat rencana kerja dan status tiap langkah |
+| `/surface` | Peta attack surface (host, endpoint, teknologi, trust) |
+| `/memory` | Fakta yang diingat antar-sesi (endpoint, teknologi, tes) |
+| `/hypotheses` | Ledger hipotesis beserta bukti pendukungnya |
+| `/next` | Langkah berikutnya beserta alasan/evidence-nya |
 | `/report` | Tulis laporan Markdown ke folder `reports/` |
 | `/clear` | Reset konteks percakapan |
 | `/exit`, `/quit` | Keluar |
@@ -164,6 +170,47 @@ Alur keamanan yang akan kamu rasakan:
 - Setiap tool gagal menghasilkan panel DIAGNOSIS dengan saran perbaikan
 
 Hasil report tersimpan di `reports/report-YYYYMMDD-HHMMSS.md`; riwayat command di `logs/commands.jsonl`.
+
+---
+
+## Lapisan Intelijen (persistent state)
+
+Agent tidak mulai dari nol setiap percakapan. Semua hasil kerja disimpan di
+`memory/knowledge.json` (otomatis, atomic write, ikut ter-backup bersama folder
+repo tapi tidak di-commit) dan disuntikkan sebagai blok `<session_state>` di atas
+percakapan setiap turn.
+
+| Komponen | Isi | Diisi oleh |
+|---|---|---|
+| Memory | endpoint, teknologi, tes yang sudah dijalankan, observasi, preferensi user | otomatis + `remember_endpoint`, `note_observation`, `remember_preference` |
+| Attack surface | graph host → endpoint → teknologi → trust, plus relasi | otomatis dari hasil tool + `remember_endpoint` |
+| Evidence ledger | temuan dengan status `observed` → `suspected` → `verified`/`refuted` | otomatis dari tool, `record_finding`, `verify_finding` |
+| Hypothesis ledger | pernyataan + alasan + test plan + bukti pendukung | `propose_hypothesis`, `update_hypothesis` |
+| Plan | tujuan dan langkah dengan status `pending`/`in_progress`/`done`/`blocked` | `set_plan`, `update_plan_step` |
+| Next actions | langkah berikutnya + tool + alasan evidence | `next_actions` |
+
+Aturan main yang berjalan otomatis:
+
+- Hasil tool otomatis masuk memory: endpoint yang ditemukan, teknologi, dan tes yang
+  sudah pernah dijalankan — jadi agent tidak mengulang scan yang sama.
+- Temuan dari tool berstatus `observed`. `record_finding` tanpa bukti mulai sebagai
+  `suspected`; hanya `verify_finding` yang menaikkan ke `verified` (atau menolak ke
+  `refuted` bila disprove-nya sahih).
+- `supported`/`refuted` untuk sebuah hipotesis hanya diterima jika menyertakan id
+  temuan sebagai bukti — status tidak bisa diisi asal isi.
+- `next_actions` hanya menyarankan tes yang belum tercatat di memory dan menyertakan
+  alasan evidence-nya.
+
+Sesi contoh:
+
+```text
+You > recon example.com
+You > /plan
+You > apakah ada SQLi di /api/items?
+You > /hypotheses
+You > /memory
+You > /next
+```
 
 ---
 
@@ -193,6 +240,20 @@ go install github.com/projectdiscovery/httpx/cmd/httpx@latest
 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 go install github.com/ffuf/ffuf/v2@latest
 ```
+
+### Kali Linux
+
+Hampir semua tool di atas sudah tersedia di repo Kali, jadi `install_tool` otomatis memilih paket apt bila memang ada di sistem:
+
+```bash
+sudo apt install nuclei httpx-toolkit ffuf subfinder naabu gobuster whatweb nikto wafw00f amass dnsutils
+```
+
+Detail penting:
+- **httpx** dari Kali bernama paket `httpx-toolkit` (paket `httpx` yang biasa adalah library C lain) — sistem sudah memakai nama paket yang benar
+- Kalau paket apt tidak ada (mis. di Ubuntu biasa), sistem otomatis jatuh ke `go install` atau plan portable lain, bukan gagal
+- **sqlmap** dipasang via apt atau `pipx` lebih dulu; `pip --user` dihindari karena Kali modern memblokirnya (PEP 668)
+- Butuh Go untuk tool yang belum dipaketkan: `sudo apt install golang-go` (juga tersedia lewat `install_tool`)
 
 Alternatif tanpa Go: unduh binary rilis dari GitHub masing-masing project lalu letakkan di PATH.
 

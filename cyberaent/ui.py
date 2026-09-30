@@ -17,6 +17,7 @@ from .agent import (
     AssistantText,
     ConfirmationRequest,
     Event,
+    IntelUpdated,
     ToolCallEnd,
     ToolCallStart,
     ToolDiagnosis,
@@ -75,9 +76,66 @@ class ConsoleUI:
     def help(self) -> None:
         self.console.print(
             "[dim]Commands: /help show this help · /history recent commands · "
-            "/findings evidence ledger · /report write Markdown report · "
-            "/clear reset conversation · /exit quit. Everything else is natural language.[/dim]"
+            "/findings evidence ledger · /plan current plan · /surface attack-surface "
+            "graph · /memory remembered facts · /hypotheses hypothesis ledger · "
+            "/next justified next actions · /report write Markdown report · "
+            "/clear reset conversation · /exit quit. Everything else is natural "
+            "language.[/dim]"
         )
+
+    def show_plan(self, plan: dict[str, Any]) -> None:
+        steps = plan.get("steps") or []
+        if not steps:
+            self.console.print("[dim]No plan yet — the agent creates one with set_plan.[/]")
+            return
+        self.console.print(f"[bold]Plan:[/] {plan.get('goal') or '(unnamed)'}")
+        markers = {"done": "[green]x[/]", "blocked": "[red]![/]", "in_progress": "[yellow]>[/]"}
+        for step in steps:
+            status = str(step.get("status", "pending"))
+            marker = markers.get(status, "[dim]-[/]")
+            note = f" [dim]({step['note']})[/]" if step.get("note") else ""
+            self.console.print(f"  {marker} {step.get('index')}. {step.get('title')}{note}")
+
+    def show_hypotheses(self, hypotheses: list[dict[str, Any]], stats: dict[str, Any]) -> None:
+        if not hypotheses:
+            self.console.print("[dim]No hypotheses recorded yet.[/]")
+            return
+        counts = stats.get("counts") or {}
+        summary = " · ".join(f"{count} {key}" for key, count in counts.items() if count)
+        self.console.print(f"[bold]Hypotheses[/] [dim]({summary})[/]")
+        styles = {
+            "supported": "green",
+            "refuted": "dim",
+            "testing": "yellow",
+            "proposed": "cyan",
+        }
+        table = Table(title="Hypothesis ledger")
+        table.add_column("id", style="dim")
+        table.add_column("status")
+        table.add_column("statement", overflow="fold")
+        table.add_column("evidence", style="dim", overflow="fold")
+        for row in hypotheses:
+            status = str(row.get("status", ""))
+            table.add_row(
+                str(row.get("id", "")),
+                Text(status, style=styles.get(status, "white")),
+                str(row.get("statement", "")),
+                ", ".join(str(ref) for ref in row.get("evidence") or []) or "—",
+            )
+        self.console.print(table)
+
+    def show_memory(self, memory_stats: dict[str, int], endpoints: list[dict[str, Any]]) -> None:
+        summary = " · ".join(f"{value} {key}" for key, value in memory_stats.items())
+        self.console.print(f"[bold]Memory[/] [dim]{summary}[/dim]")
+        if not endpoints:
+            self.console.print("[dim]No endpoints remembered yet.[/]")
+            return
+        for row in endpoints:
+            params = ", ".join(str(param) for param in row.get("params") or []) or "—"
+            techs = ", ".join(str(tech) for tech in row.get("technologies") or []) or "—"
+            self.console.print(
+                f"  {row.get('method')} {row.get('url')} [dim](params: {params} · tech: {techs})[/]"
+            )
 
     def show_findings(
         self, findings: list[dict[str, Any]], counts: dict[str, int]
@@ -229,6 +287,11 @@ class ConsoleUI:
             )
         elif isinstance(event, AgentFailure):
             self.console.print(f"[red]Agent error[/]\n{describe_error(event.error)}")
+        elif isinstance(event, IntelUpdated):
+            line = f"[cyan]intel[/] {event.summary}"
+            if event.detail:
+                line += f" [dim]({event.detail})[/]"
+            self.console.print(line)
 
     def _render_tool_start(self, event: ToolCallStart) -> None:
         if not event.risk and not event.detail:

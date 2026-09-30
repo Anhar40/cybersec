@@ -12,6 +12,7 @@ from cyberaent.tools.evidence import (
     MAX_TEXT_LENGTH,
     MAX_TITLE_LENGTH,
     SEVERITIES,
+    STATUSES,
     EvidenceStore,
     build_evidence_tools,
     recording_spec,
@@ -217,6 +218,7 @@ def test_tool_names_and_risk_tiers(built: tuple[list[Any], EvidenceStore, Path])
     specs = built[0]
     assert [spec.name for spec in specs] == [
         "record_finding",
+        "verify_finding",
         "list_findings",
         "generate_report",
     ]
@@ -352,3 +354,238 @@ def test_recording_spec_captures_without_mutating_payload() -> None:
 
 def test_severities_constant_ordering() -> None:
     assert SEVERITIES == ("critical", "high", "medium", "low", "info")
+
+
+# --------------------------------------------------------------- status taxonomy
+def test_statuses_constant_ordering() -> None:
+    assert STATUSES == ("verified", "observed", "suspected", "refuted")
+
+
+def test_manual_finding_defaults_to_suspected() -> None:
+    store = make_store()
+    result = store.add(source_tool="manual", title="Maybe SQLi", severity="high")
+    assert result.record["status"] == "suspected"
+    assert result.record["verification"] == ""
+    assert result.record["verified_at"] == ""
+
+
+def test_manual_finding_with_verification_is_verified() -> None:
+    store = make_store()
+    result = store.add(
+        source_tool="manual",
+        title="SQLi",
+        severity="critical",
+        verification="reproduced with sqlmap --level 3",
+    )
+    assert result.record["status"] == "verified"
+    assert result.record["verified_at"] == "2026-08-23T12:00:00+00:00"
+
+
+def test_explicit_status_is_validated() -> None:
+    store = make_store()
+    observed = store.add(
+        source_tool="manual", title="Odd header", severity="info", status="OBSERVED"
+    )
+    assert observed.record["status"] == "observed"
+    with pytest.raises(ValueError, match="status"):
+        store.add(source_tool="manual", title="Bad", severity="info", status="probably-fine")
+
+def test_duplicate_add_promotes_but_never_downgrades() -> None:
+    store = make_store()
+    store.add(source_tool="vuln_scan", title="Missing HSTS", severity="high", status="observed")
+    store.add(
+        source_tool="vuln_scan",
+        title="Missing HSTS",
+        severity="high",
+        status="verified",
+        verification="curl -I confirms no Strict-Transport-Security",
+    )
+    record = store.findings()[0]
+    assert record["status"] == "verified"
+    assert record["verified_at"]
+
+    store.add(source_tool="vuln_scan", title="Missing HSTS", severity="high", status="observed")
+    assert store.findings()[0]["status"] == "verified"
+    assert len(store.findings()) == 1
+
+
+def test_verify_marks_verified_with_method() -> None:
+    store = make_store()
+    added = store.add(source_tool="manual", title="IDOR", severity="high")
+    result = store.verify(
+        added.record["id"],
+        method="GET /api/orders/1002 as user bob returned alice's order",
+        evidence="200 with foreign user_id",
+    )
+    record = result.record
+    assert record["status"] == "verified"
+    assert record["verified_at"] == "2026-08-23T12:00:00+00:00"
+    assert record["evidence"] == "200 with foreign user_id"
+    assert "alice" in record["verification"]
+    assert store.findings(status="verified")[0]["id"] == added.record["id"]
+
+
+def test_verify_can_refute() -> None:
+    store = make_store()
+    added = store.add(source_tool="vuln_scan", title="Possible open redirect", severity="low")
+    record = store.verify(
+        added.record["id"], method="retested, server normalizes input", confirmed=False
+    ).record
+    assert record["status"] == "refuted"
+    assert store.findings(status="refuted") == [record]
+    assert store.findings(status="verified") == []
+
+
+def test_verify_rejects_bad_input() -> None:
+    store = make_store()
+    with pytest.raises(ValueError, match="No finding"):
+        store.verify("F-999", method="curl")
+    added = store.add(source_tool="manual", title="X", severity="low")
+    with pytest.raises(ValueError, match="method"):
+        store.verify(added.record["id"], method="   ")
+
+
+def test_observe_captures_as_observed_not_verified() -> None:
+    store = make_store()
+    created = store.observe("vuln_scan", vuln_scan_payload())
+    assert [record["status"] for record in created] == ["observed", "observed"]
+    assert store.status_counts() == {"observed": 2}
+    assert store.findings(status="verified") == []
+
+
+def test_status_counts_and_filters(built: tuple[list[Any], EvidenceStore, Path]) -> None:
+    _specs, store, _ = built
+    store.add(source_tool="manual", title="a", severity="high", verification="proved")
+    store.add(source_tool="manual", title="b", severity="low")
+    store.add(source_tool="manual", title="c", severity="info", status="observed")
+    assert store.status_counts() == {"verified": 1, "suspected": 1, "observed": 1}
+    assert [f["title"] for f in store.findings(status="observed")] == ["c"]
+    with pytest.raises(ValueError, match="status"):
+        store.findings(status="maybe")
+
+
+# ----------------------------------------------------------------- report layout
+def test_report_separates_confirmed_unconfirmed_and_refuted() -> None:
+    store = make_store()
+    store.add(
+        source_tool="manual", title="Confirmed RCE", severity="critical", verification="proof"
+    )
+    store.add(source_tool="manual", title="Hypothesis only", severity="medium")
+    refuted = store.add(source_tool="manual", title="False positive", severity="low")
+    store.verify(refuted.record["id"], method="not reproducible", confirmed=False)
+
+    report = render_markdown_report(title="R", findings=store.findings(), generated_at="now")
+
+    assert "## Confirmed findings" in report
+    assert "## Unconfirmed observations" in report
+    assert "## Refuted" in report
+    assert report.index("## Confirmed findings") < report.index("## Unconfirmed observations")
+    assert report.index("## Unconfirmed observations") < report.index("## Refuted")
+    assert "Status breakdown: 1 verified · 1 suspected · 1 refuted" in report
+    assert "**Verification:** proof" in report
+    assert "not confirmed vulnerabilities" in report
+
+
+def test_report_shows_status_line_per_finding() -> None:
+    store = make_store()
+    store.add(source_tool="manual", title="Hypothesis", severity="medium")
+    report = render_markdown_report(title="R", findings=store.findings(), generated_at="now")
+    assert "- Status: suspected" in report
+    assert "## Findings" not in report
+
+
+# ------------------------------------------------------------ verify tool wiring
+def test_verify_finding_handler(built: tuple[list[Any], EvidenceStore, Path]) -> None:
+    specs, store, _ = built
+    store.add(source_tool="manual", title="XSS in search", severity="high")
+    verifier = spec_by_name(specs, "verify_finding")
+    payload = verifier.handler(
+        {"finding_id": "F-001", "method": "confirmed reflected payload", "evidence": "alert(1)"}
+    )
+    assert payload["status"] == "verified"
+    assert payload["finding"]["verification"] == "confirmed reflected payload"
+    assert "marked verified" in str(payload["summary"])
+
+
+def test_verify_finding_handler_reports_unknown_id(
+    built: tuple[list[Any], EvidenceStore, Path],
+) -> None:
+    specs, _store, _ = built
+    verifier = spec_by_name(specs, "verify_finding")
+    payload = verifier.handler({"finding_id": "F-404", "method": "curl"})
+    assert payload["error"] == "verification_failed"
+    assert "F-404" in payload["detail"]
+
+
+def test_list_findings_handler_filters_by_status(
+    built: tuple[list[Any], EvidenceStore, Path],
+) -> None:
+    specs, store, _ = built
+    store.add(source_tool="manual", title="a", severity="high", verification="proved")
+    store.add(source_tool="manual", title="b", severity="low")
+    listing = spec_by_name(specs, "list_findings")
+
+    payload = listing.handler({"status": "verified"})
+
+    assert payload["filter_status"] == "verified"
+    assert payload["count"] == 1
+    assert payload["status_counts"] == {"verified": 1, "suspected": 1}
+
+    with pytest.raises(ValueError, match="status"):
+        listing.handler({"status": "maybe"})
+
+
+def test_record_finding_handler_defaults_and_hint(
+    built: tuple[list[Any], EvidenceStore, Path],
+) -> None:
+    specs, _store, _ = built
+    recorder = spec_by_name(specs, "record_finding")
+    payload = recorder.handler({"title": "Guess", "severity": "low"})
+    assert payload["finding"]["status"] == "suspected"
+    assert "verify_finding" in payload["hint"]
+
+    confirmed = recorder.handler(
+        {"title": "Proven", "severity": "high", "verification": "curl reproduced"}
+    )
+    assert confirmed["finding"]["status"] == "verified"
+    assert confirmed["hint"] == ""
+
+
+def test_gate_validates_verify_and_list_arguments(
+    built: tuple[list[Any], EvidenceStore, Path],
+) -> None:
+    registry = ToolRegistry()
+    for spec in built[0]:
+        registry.register(spec)
+    gate = SafetyGate(registry)
+
+    ok = gate.evaluate("verify_finding", {"finding_id": "F-001", "method": "replayed request"})
+    assert ok.allowed is True
+
+    missing_method = gate.evaluate("verify_finding", {"finding_id": "F-001"})
+    assert missing_method.allowed is False
+
+    empty_id = gate.evaluate("verify_finding", {"finding_id": "  ", "method": "curl"})
+    assert empty_id.allowed is False
+
+    bad_status = gate.evaluate("list_findings", {"status": "nope"})
+    assert bad_status.allowed is False
+
+    explicit_status = gate.evaluate(
+        "record_finding", {"title": "t", "severity": "low", "status": "refuted"}
+    )
+    assert explicit_status.allowed is True
+
+
+def test_generate_report_handler_reports_status_counts(
+    built: tuple[list[Any], EvidenceStore, Path],
+) -> None:
+    specs, store, _reports = built
+    store.add(source_tool="manual", title="Confirmed", severity="high", verification="proof")
+    generator = spec_by_name(specs, "generate_report")
+    payload = generator.handler({})
+    assert payload["status_counts"] == {"verified": 1}
+    assert payload["verified_count"] == 1
+    content = Path(str(payload["path"])).read_text(encoding="utf-8")
+    assert "## Confirmed findings" in content
+    assert "## Unconfirmed observations" not in content

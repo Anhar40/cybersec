@@ -26,6 +26,7 @@ from .terminal import (
 INSTALL_TIMEOUT_S = 1200
 MAX_ARG_LENGTH = 200
 MAX_USER_PATH_CHARS = 4000
+AVAILABILITY_TIMEOUT_S = 20
 
 PATH_BLOCK_BEGIN = "# >>> cyberaent path >>>"
 PATH_BLOCK_END = "# <<< cyberaent path <<<"
@@ -37,22 +38,72 @@ INSTALL_PLANS: dict[str, dict[str, list[str]]] = {
         "go": ["go", "install", "github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest"],
         "scoop": ["scoop", "install", "nuclei"],
         "choco": ["choco", "install", "-y", "nuclei"],
+        "apt-get": ["apt-get", "install", "-y", "nuclei"],
     },
     "httpx": {
         "go": ["go", "install", "github.com/projectdiscovery/httpx/cmd/httpx@latest"],
         "scoop": ["scoop", "install", "httpx"],
+        "choco": ["choco", "install", "-y", "httpx"],
+        # Kali ships the ProjectDiscovery toolkit as httpx-toolkit; the plain
+        # `httpx` apt package is an unrelated C library.
+        "apt-get": ["apt-get", "install", "-y", "httpx-toolkit"],
     },
     "ffuf": {
         "go": ["go", "install", "github.com/ffuf/ffuf/v2@latest"],
         "scoop": ["scoop", "install", "ffuf"],
+        "choco": ["choco", "install", "-y", "ffuf"],
+        "apt-get": ["apt-get", "install", "-y", "ffuf"],
     },
     "subfinder": {
         "go": ["go", "install", "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"],
         "scoop": ["scoop", "install", "subfinder"],
+        "choco": ["choco", "install", "-y", "subfinder"],
+        "apt-get": ["apt-get", "install", "-y", "subfinder"],
     },
     "naabu": {
         "go": ["go", "install", "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest"],
         "scoop": ["scoop", "install", "naabu"],
+        "choco": ["choco", "install", "-y", "naabu"],
+        "apt-get": ["apt-get", "install", "-y", "naabu"],
+    },
+    "whatweb": {
+        "apt-get": ["apt-get", "install", "-y", "whatweb"],
+        "dnf": ["dnf", "install", "-y", "whatweb"],
+        "brew": ["brew", "install", "whatweb"],
+        "choco": ["choco", "install", "-y", "whatweb"],
+    },
+    "nikto": {
+        "apt-get": ["apt-get", "install", "-y", "nikto"],
+        "brew": ["brew", "install", "nikto"],
+        "choco": ["choco", "install", "-y", "nikto"],
+    },
+    "gobuster": {
+        "apt-get": ["apt-get", "install", "-y", "gobuster"],
+        "dnf": ["dnf", "install", "-y", "gobuster"],
+    },
+    "wafw00f": {
+        "apt-get": ["apt-get", "install", "-y", "wafw00f"],
+        "dnf": ["dnf", "install", "-y", "wafw00f"],
+    },
+    "amass": {
+        "go": ["go", "install", "github.com/owasp-amass/amass/v4/...@master"],
+        "apt-get": ["apt-get", "install", "-y", "amass"],
+    },
+    "dig": {
+        "apt-get": ["apt-get", "install", "-y", "dnsutils"],
+        "dnf": ["dnf", "install", "-y", "bind-utils"],
+        "brew": ["brew", "install", "bind"],
+    },
+    "openssl": {
+        "apt-get": ["apt-get", "install", "-y", "openssl"],
+        "dnf": ["dnf", "install", "-y", "openssl"],
+    },
+    "go": {
+        "apt-get": ["apt-get", "install", "-y", "golang-go"],
+        "dnf": ["dnf", "install", "-y", "golang"],
+        "brew": ["brew", "install", "go"],
+        "choco": ["choco", "install", "-y", "golang"],
+        "winget": ["winget", "install", "-e", "--id", "GoLang.Go"],
     },
     "nmap": {
         "winget": [
@@ -73,6 +124,7 @@ INSTALL_PLANS: dict[str, dict[str, list[str]]] = {
         "apk": ["apk", "add", "nmap"],
     },
     "sqlmap": {
+        "pipx": ["pipx", "install", "sqlmap"],
         "pip": ["pip", "install", "--user", "sqlmap"],
         "choco": ["choco", "install", "-y", "sqlmap"],
         "brew": ["brew", "install", "sqlmap"],
@@ -82,7 +134,7 @@ INSTALL_PLANS: dict[str, dict[str, list[str]]] = {
     },
 }
 
-_EXTRA_INSTALLERS = ("go", "pip")
+_EXTRA_INSTALLERS = ("go", "pipx", "pip")
 
 _PREFERRED_BY_PLATFORM: dict[str, tuple[str, ...]] = {
     "win32": ("winget", "choco", "scoop"),
@@ -105,6 +157,44 @@ def _fake_mode() -> bool:
     return os.environ.get(FAKE_INSTALL_ENV) == "1"
 
 
+def _package_available(manager: str, argv: list[str]) -> bool:
+    """Cheap offline check that a distro package actually exists.
+
+    Kali/Debian repositories differ wildly from Ubuntu and RHEL; without this
+    gate the agent would pick ``apt-get`` blindly and fail with
+    "Unable to locate package" instead of falling back to a portable plan.
+    """
+    pkg = argv[-1]
+    probes = {
+        "apt-get": ["apt-cache", "policy", pkg],
+        "dnf": ["dnf", "-q", "list", "--available", pkg],
+        "pacman": ["pacman", "-Si", pkg],
+        "apk": ["apk", "info", "-e", pkg],
+    }
+    probe = probes.get(manager)
+    if probe is None:
+        return True
+    try:
+        proc = subprocess.run(
+            probe,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=AVAILABILITY_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    output = proc.stdout or ""
+    if manager == "apt-get":
+        return any(
+            line.strip().startswith("Candidate:") and "(none)" not in line
+            for line in output.splitlines()
+        )
+    return bool(output.strip())
+
+
 def pick_plan(name: str) -> tuple[str, list[str]] | None:
     """Return (manager, argv) for the best available installer of ``name``."""
     plans = INSTALL_PLANS.get(name)
@@ -114,7 +204,7 @@ def pick_plan(name: str) -> tuple[str, list[str]] | None:
         return "fake", ["fake-installer", name]
     for manager in available_installers():
         argv = plans.get(manager)
-        if argv:
+        if argv and _package_available(manager, list(argv)):
             return manager, list(argv)
     return None
 

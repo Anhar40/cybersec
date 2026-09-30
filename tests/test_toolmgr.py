@@ -175,6 +175,121 @@ def test_install_timeout_and_oserror_paths(monkeypatch: pytest.MonkeyPatch) -> N
     assert failed["error"] == "execution_failed"
 
 
+def _fake_runner(returncode: int, stdout: str, stderr: str = "") -> Any:
+    def run(argv: list[str], **kwargs: Any) -> Any:
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return run
+
+
+def test_pick_plan_falls_back_to_go_when_debian_package_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(toolmgr, "available_installers", lambda: ["apt-get", "go"])
+    monkeypatch.setattr(
+        toolmgr.subprocess,
+        "run",
+        _fake_runner(100, "", "N: Unable to locate package nuclei"),
+    )
+
+    plan = toolmgr.pick_plan("nuclei")
+
+    assert plan is not None
+    manager, argv = plan
+    assert manager == "go"
+    assert argv[0] == "go" and argv[1] == "install"
+
+
+def test_pick_plan_uses_debian_package_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(toolmgr, "available_installers", lambda: ["apt-get", "go"])
+    apt_policy = "nuclei:\n  Installed: (none)\n  Candidate: 3.1.5-1\n  Version table: 3.1.5-1\n"
+    monkeypatch.setattr(toolmgr.subprocess, "run", _fake_runner(0, apt_policy))
+
+    plan = toolmgr.pick_plan("nuclei")
+
+    assert plan is not None
+    manager, argv = plan
+    assert manager == "apt-get"
+    assert argv == ["apt-get", "install", "-y", "nuclei"]
+
+
+def test_pick_plan_detects_missing_candidate_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(toolmgr, "available_installers", lambda: ["apt-get", "go"])
+    monkeypatch.setattr(
+        toolmgr.subprocess,
+        "run",
+        _fake_runner(0, "nuclei:\n  Installed: (none)\n  Candidate: (none)\n"),
+    )
+
+    plan = toolmgr.pick_plan("nuclei")
+
+    assert plan is not None
+    manager, _ = plan
+    assert manager == "go"
+
+
+def test_httpx_plan_targets_kali_toolkit_package() -> None:
+    assert toolmgr.INSTALL_PLANS["httpx"]["apt-get"] == [
+        "apt-get",
+        "install",
+        "-y",
+        "httpx-toolkit",
+    ]
+
+
+def test_install_plans_cover_common_kali_tools() -> None:
+    expected = {
+        "nuclei": "nuclei",
+        "ffuf": "ffuf",
+        "subfinder": "subfinder",
+        "naabu": "naabu",
+        "whatweb": "whatweb",
+        "nikto": "nikto",
+        "gobuster": "gobuster",
+        "wafw00f": "wafw00f",
+        "amass": "amass",
+        "dig": "dnsutils",
+        "go": "golang-go",
+        "sqlmap": "sqlmap",
+        "nmap": "nmap",
+    }
+    for tool, package in expected.items():
+        plans = toolmgr.INSTALL_PLANS[tool]
+        assert "apt-get" in plans, f"{tool} has no apt-get plan"
+        assert plans["apt-get"][-1] == package
+
+
+def test_sqlmap_prefers_pipx_over_blocked_pip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(toolmgr, "available_installers", lambda: ["pipx", "pip"])
+    plan = toolmgr.pick_plan("sqlmap")
+    assert plan is not None
+    manager, argv = plan
+    assert manager == "pipx"
+    assert argv == ["pipx", "install", "sqlmap"]
+
+    monkeypatch.setattr(toolmgr, "available_installers", lambda: ["pip"])
+    fallback_plan = toolmgr.pick_plan("sqlmap")
+    assert fallback_plan is not None
+    fallback, fallback_argv = fallback_plan
+    assert fallback == "pip" and "--user" in fallback_argv
+
+
+def test_package_probe_skips_timeout_and_missing_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(argv: list[str], **kwargs: Any) -> Any:
+        raise subprocess.TimeoutExpired(cmd=argv[0], timeout=20)
+
+    monkeypatch.setattr(toolmgr.subprocess, "run", timeout)
+    assert toolmgr._package_available("apt-get", ["apt-get", "install", "-y", "nuclei"]) is False
+
+    assert toolmgr._package_available("go", ["go", "install", "x@latest"]) is True
+
+
 def test_compute_missing_dirs_folds_case_on_windows(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

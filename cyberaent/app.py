@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .agent import ConfirmationRequest, Event, SecurityAgent
 from .config import ConfigError, Settings, load_dotenv
+from .intel import IntelHub
 from .openrouter import OpenRouterClient
 from .safety import SafetyGate
 from .tools.assess import build_vulnerability_tools
@@ -18,13 +19,27 @@ from .tools.evidence import (
     write_report,
 )
 from .tools.fsops import build_fsops_tools
+from .tools.intel import build_intel_tools
 from .tools.recon import build_web_recon_tools
 from .tools.terminal import CommandHistory, build_terminal_tool
 from .tools.toolmgr import build_tool_manager_tools
 from .tools.websec import build_web_security_tools
 from .ui import ConsoleUI
 
-SLASH_COMMANDS = {"/help", "/clear", "/exit", "/quit", "/history", "/findings", "/report"}
+SLASH_COMMANDS = {
+    "/help",
+    "/clear",
+    "/exit",
+    "/quit",
+    "/history",
+    "/findings",
+    "/report",
+    "/plan",
+    "/surface",
+    "/memory",
+    "/hypotheses",
+    "/next",
+}
 REPORTS_DIR = Path("reports")
 
 
@@ -56,7 +71,8 @@ def main(argv: list[str] | None = None) -> int:
     client = OpenRouterClient(settings)
     registry = default_registry()
     history = CommandHistory()
-    evidence = EvidenceStore()
+    intel = IntelHub(evidence_store=EvidenceStore())
+    evidence = intel.evidence
     log_path = Path("logs/commands.jsonl")
     registry.register(build_terminal_tool(history=history, log_path=log_path))
     for spec in build_tool_manager_tools(history=history, log_path=log_path):
@@ -70,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
     ):
         for spec in source:
             registry.register(recording_spec(spec, evidence))
-    for spec in build_evidence_tools(store=evidence, reports_dir=REPORTS_DIR):
+    for spec in build_evidence_tools(store=evidence, reports_dir=REPORTS_DIR, intel=intel):
+        registry.register(spec)
+    for spec in build_intel_tools(intel):
         registry.register(spec)
     gate = SafetyGate(registry)
 
@@ -80,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     def confirm(request: ConfirmationRequest) -> bool:
         return ui.confirm(request)
 
-    agent = SecurityAgent(client, registry, gate, confirm=confirm)
+    agent = SecurityAgent(client, registry, gate, confirm=confirm, intel=intel)
 
     while True:
         try:
@@ -111,6 +129,21 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if command == "/findings":
             ui.show_findings(evidence.findings(), evidence.counts())
+            continue
+        if command == "/plan":
+            ui.show_plan(intel.plan())
+            continue
+        if command == "/surface":
+            ui.console.print(intel.surface.markdown())
+            continue
+        if command == "/memory":
+            ui.show_memory(intel.memory.stats(), intel.memory.endpoints())
+            continue
+        if command == "/hypotheses":
+            ui.show_hypotheses(intel.hypotheses.all(), intel.hypotheses.stats())
+            continue
+        if command == "/next":
+            ui.console.print(intel.strategy.markdown())
             continue
         if command == "/report":
             try:

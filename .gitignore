@@ -21,3 +21,4 @@ dist/
 # Runtime output
 logs/
 reports/
+memory/

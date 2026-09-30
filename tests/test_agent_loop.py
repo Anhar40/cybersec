@@ -4,21 +4,25 @@ import json
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from cyberaent.agent import (
     AgentFailure,
     AssistantDelta,
     AssistantText,
+    IntelUpdated,
     SecurityAgent,
     ToolCallEnd,
     ToolCallStart,
     ToolDiagnosis,
     TurnLimitReached,
 )
+from cyberaent.intel import IntelHub
 from cyberaent.openrouter import AssistantReply, OpenRouterError, RateLimitError, ToolCallRequest
 from cyberaent.safety import SafetyGate
 from cyberaent.tools.base import RiskLevel, ToolRegistry, ToolSpec
+from cyberaent.tools.intel import build_intel_tools
 
 
 @dataclass
@@ -490,3 +494,127 @@ def test_tool_start_carries_risk_and_detail() -> None:
     high_start = next(e for e in high_events if isinstance(e, ToolCallStart))
     assert high_start.risk == "high"
     assert json.loads(high_start.detail or "{}") == {"k": "v"}
+
+
+# ----------------------------------------------------------------- intel layer
+def make_intel_agent(tmp_path: Path, client: Any) -> tuple[SecurityAgent, IntelHub]:
+    hub = IntelHub(memory_path=tmp_path / "knowledge.json")
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="http_probe",
+            description="probe",
+            parameters={"type": "object", "properties": {}},
+            risk=RiskLevel.MEDIUM,
+            handler=lambda args: {
+                "summary": "1 live",
+                "results": [{"url": "https://x.test/a", "status_code": 200}],
+            },
+        )
+    )
+    for spec in build_intel_tools(hub):
+        registry.register(spec)
+    agent = SecurityAgent(
+        client, registry, SafetyGate(registry), confirm=lambda _request: True, intel=hub
+    )
+    return agent, hub
+
+
+def test_intel_brief_is_injected_before_model_call(tmp_path: Path) -> None:
+    hub = IntelHub(memory_path=tmp_path / "knowledge.json")
+    hub.remember_endpoint(url="https://x.test/a", tech="nginx")
+    client = ScriptedClient([final("ok")])
+    registry = ToolRegistry()
+    agent = SecurityAgent(client, registry, SafetyGate(registry), intel=hub)
+
+    list(agent.process("lanjut"))
+
+    state_messages = [m for m in agent.messages if m["role"] == "system"]
+    assert len(state_messages) == 2
+    state = state_messages[1]["content"]
+    assert "<session_state>" in state
+    assert "https://x.test/a" in state
+    assert "nginx" in state
+
+
+def test_no_state_block_when_intel_is_empty(tmp_path: Path) -> None:
+    hub = IntelHub(memory_path=tmp_path / "knowledge.json")
+    client = ScriptedClient([final("ok")])
+    registry = ToolRegistry()
+    agent = SecurityAgent(client, registry, SafetyGate(registry), intel=hub)
+
+    list(agent.process("mulai"))
+
+    assert [m for m in agent.messages if m["role"] == "system"] == [agent.messages[0]]
+
+
+def test_tool_results_are_captured_into_ledgers(tmp_path: Path) -> None:
+    client = ScriptedClient(
+        [
+            tool_reply("c1", "http_probe", '{"urls": ["https://x.test/a"]}'),
+            final("done"),
+        ]
+    )
+    agent, hub = make_intel_agent(tmp_path, client)
+
+    list(agent.process("probe"))
+
+    assert hub.memory.endpoints()[0]["url"] == "https://x.test/a"
+    assert hub.memory.test_done("http_probe", "https://x.test/a")
+    assert hub.surface.hosts() == ["x.test"]
+
+
+def test_intel_tools_emit_update_event_and_state_snapshot(tmp_path: Path) -> None:
+    client = ScriptedClient(
+        [
+            tool_reply(
+                "c1",
+                "set_plan",
+                '{"goal": "assess x.test", "steps": ["recon", "headers"]}',
+            ),
+            final("done"),
+        ]
+    )
+    agent, hub = make_intel_agent(tmp_path, client)
+
+    events = list(agent.process("plan"))
+
+    update = next(e for e in events if isinstance(e, IntelUpdated))
+    assert update.tool == "set_plan"
+    assert "2 step" in update.summary
+    assert "0 endpoints" in update.detail
+    assert hub.plan()["goal"] == "assess x.test"
+
+
+def test_failed_intel_tool_emits_no_update_event(tmp_path: Path) -> None:
+    client = ScriptedClient(
+        [
+            tool_reply("c1", "propose_hypothesis", '{"statement": "s"}'),
+            final("done"),
+        ]
+    )
+    agent, _hub = make_intel_agent(tmp_path, client)
+
+    events = list(agent.process("hypothesis"))
+
+    assert not [e for e in events if isinstance(e, IntelUpdated)]
+
+
+def test_intel_layer_never_breaks_a_turn(tmp_path: Path) -> None:
+    class ExplodingIntel:
+        def brief(self) -> str:
+            raise RuntimeError("boom")
+
+        def state_summary(self) -> str:
+            raise RuntimeError("boom")
+
+        def observe_tool_result(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+            raise RuntimeError("boom")
+
+    client = ScriptedClient([tool_reply("c1", "environment"), final("ok")])
+    agent = make_agent(client, intel=ExplodingIntel())
+
+    events = list(agent.process("go"))
+
+    assert any(isinstance(e, AssistantText) for e in events)
+    assert agent.messages[-1]["role"] == "assistant"
